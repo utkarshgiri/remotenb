@@ -1,0 +1,96 @@
+#!/Users/ugiri/anaconda3/bin/python
+
+import sys
+import fire
+import time
+import invoke
+import socket
+import subprocess
+import webbrowser
+from fabric import Config, Connection
+
+#TODO: Logic needs improvement
+
+def main(host, env='cmb', browser='chrome', hop=True):
+    #If you want to hop over a jump server, hop must be set to True
+    if hop:
+        #Create gateway by providing hostname and username for jump server
+        gateway = Connection(host='symmetry', user='ugiri')
+    else:
+        gateway = None
+    #host is the hostname of the server node; user is the username for server
+    client = Connection(host=host, user="ugiri", forward_agent=True, gateway=gateway)
+    #Compose the command which is to be executed on the server to start jupyter-notebook
+    executable = "/home/ugiri/anaconda3/envs/{}/bin/jupyter-notebook".format(env)
+    #Compose tthe command which will list the notebooks running on server, if any
+    nblistings = "/home/ugiri/anaconda3/envs/{}/bin/jupyter-notebook {}".format(env, 'list')
+    #Executable that will launch firefox on the client side
+    firefox = "open -a /Applications/Firefox.app %s"
+    #Executable that will launch chrome on the client side
+    chrome = 'open -a /Applications/Google\ Chrome.app %s'
+    
+    #Try to kill a running tmux session name jupyter, if any
+    try: 
+        client.run('tmux kill-session -t jupyter', hide=True)
+    except: 
+        pass
+
+    #The following function starts the notebook on the server
+    def start():
+        #The command that should be run on the server side to start jupyter-notebook session in a tmux session named jupyter
+        command = '''tmux new-session -d -s jupyter {}'''.format(executable)
+        #Running the above command on the remotte server using fabric; sleeping for 3 seconds to let that be processed
+        notebook = client.run(command, hide=True); time.sleep(3)
+        #running a command to find the list of running notebook servers on the server node        
+        notebooks = "{.stdout}".format(client.run(nblistings, hide=True)).split('\n')[1:-1]; time.sleep(1)
+        #Returning the list of active notebook servers
+        return notebooks
+
+    #The following command closes running servers using port number
+    def close(ports):
+        #Looping over iterable of ports
+        for port in ports:
+            #running the command which closes ports
+            client.run('%s stop %s'%(executable, port), hide=True)
+
+    #The master command; tries to start jupyter server on remote side; returns list of running servers aftter performing the start operation
+    notebooks = start()
+    #If number of active jupyter notebooks is found to be not equal to 1; try closing ports and restarting new session
+    if len(notebooks) != 1:
+        #extract port numbers from list of running server url
+        ports = [int(x.split('localhost:')[-1].split('/')[0]) for x in notebooks if bool(x)]
+        #close the ports
+        close(ports)
+        #try starting a jupyter server again
+        notebooks = start()
+
+    #The following code is the logic after a single jupyter server has been successfully started on a remote server inside a tmux session
+    #Get the remote port number
+    remote_port = notebooks[0].split('localhost:')[-1].split('/')[0]
+    #Get the token
+    remote_token = notebooks[0].split("token=")[-1].split("::")[0]
+    #Close the client object that was handling operations on remote server
+    client.close()
+    #Create a socket and get a free port number for localhost
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(('localhost', 0))
+    s.listen(1)
+    #Get the local port to be used
+    local_port = s.getsockname()[1]
+    #cllose socket
+    s.close()
+    #Compose the tunneling command to be executed on the client side
+    local_notebook_command = 'ssh -N -f -L localhost:{}:localhost:{} {}'.format(local_port, remote_port, "ugiri@{}".format(host))
+    #execute the above command
+    subprocess.call(local_notebook_command, shell=True)
+    #Compose the url for opening the notebook
+    url='http://localhost:{}/?token={}'.format(local_port, remote_token)
+    #Open the notebook on the desired browser
+    if browser == 'chrome':
+        webbrowser.get(chrome).open(url=url)
+    else:
+        webbrowser.get(firefox).open(url=url)
+
+if __name__ == '__main__':
+    fire.Fire(main)
+
