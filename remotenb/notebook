@@ -1,3 +1,5 @@
+#!/Users/ugiri/anaconda3/envs/remotenb/bin/python
+
 import sys
 import fire
 import time
