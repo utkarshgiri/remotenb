@@ -1,5 +1,3 @@
-#!/Users/ugiri/anaconda3/bin/python
-
 import sys
 import fire
 import time
