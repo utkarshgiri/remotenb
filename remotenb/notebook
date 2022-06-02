@@ -1,103 +1,63 @@
-#!/Users/ugiri/anaconda3/envs/remotenb/bin/python
-
 import sys
 import fire
+import rich
 import time
 import invoke
 import socket
-import loguru
+import logging
 import subprocess
 import webbrowser
-from rich import print
+from rich.logging import RichHandler
 from fabric import Config, Connection
+from remotenb.helpers import *
 
-#TODO: Logic needs improvement
+logger = logging.getLogger(__name__)
+logger.propagate = False
+logger.setLevel(logging.DEBUG)
+handler = RichHandler()
+logger.addHandler(handler)
 
-def main(host, env='cmb', browser='chrome', lab=False, hop=True):
-    #If you want to hop over a jump server, hop must be set to True
-    if hop:
-        #Create gateway by providing hostname and username for jump server
- 
-        gw = Connection(host='mars', 
-                        user='ugiri',
-                        connect_kwargs= {"password": 'wisconsinmadison'})
-        gateway = Connection(host='symmetry', user='ugiri', gateway=gw)
-    else:
-        gateway = None
-    if host == 'grape':
-        tmux = '/home/ugiri/anaconda3/bin/tmux'
-    else:
-        tmux = 'tmux'
-    #host is the hostname of the server node; user is the username for server
-    client = Connection(host=host, user="ugiri", forward_agent=True, gateway=gateway)
-    #Compose the command which is to be executed on the server to start jupyter-notebook
-    jupyternb = "/home/ugiri/anaconda3/envs/{}/bin/jupyter-notebook".format(env)
-    #The executable for jupyterlab
-    jupyterlab = "/home/ugiri/anaconda3/envs/{}/bin/jupyter-lab".format(env)
-    nblistings = "/home/ugiri/anaconda3/envs/{}/bin/jupyter-notebook {}".format(env, 'list')
-    if 'cn' in host:
-        jupyterlab = "/gpfs/ugiri/anaconda38/bin/jupyter-lab"
-        jupyternb = "/gpfs/ugiri/anaconda38/bin/jupyter-notebook"
-        nblistings = "/gpfs/ugiri/anaconda38/bin/jupyter-lab {}".format('list')
-    #Compose tthe command which will list the notebooks running on server, if any
-    #Executable that will launch firefox on the client side
-    browsers = {'firefox' : "open -a /Applications/Firefox.app %s",
-                'chrome' : 'open -a /Applications/Google\ Chrome.app %s',
-                'edge': 'open -a /Applications/Microsoft\ Edge.app %s',
-                'safari': 'open -a /Applications/Safari.app %s'}
-    #Try to kill a running tmux session name jupyter, if any
-    def kill_tmux():
+
+def assert_executable_found(client, executables):
+    if not isinstance(executables, list):
+        executables = [executables]
+    for executable in executables:
         try:
-            response = client.run('{} kill-session -t jupyter'.format(tmux))
-        except: 
-            pass
+            result = client.run(f'command -v {executable}', hide=True)
+        except invoke.exceptions.UnexpectedExit:
+            logger.info(f'{executable} not found. Please manually provide remote {executable} path using --executable argument')
+            sys.exit()
+    logger.info('All required executables found. Yay!')
 
-    #The following function starts the notebook on the server
-    def start():
-        #The command that should be run on the server side to start jupyter-notebook session in a tmux session named jupyter
-        if lab:
-           executable = jupyterlab
-        else:
-            executable = jupyternb
-        command = '''{} new-session -d -s jupyter {}'''.format(tmux, executable)
-        #Running the above command on the remotte server using fabric; sleeping for 3 seconds to let that be processed
-        loguru.logger.debug('Calling the executable')
-        notebook = client.run(command); time.sleep(2)
-        #running a command to find the list of running notebook servers on the server node        
-        notebooks = "{.stdout}".format(client.run(nblistings, hide=True)).split('\n');
-        print(notebooks)
-        notebooks = notebooks[1:-1]
-        #Returning the list of active notebook servers
-        return notebooks
-
-    #The following command closes running servers using port number
-    def close(ports):
-        #Looping over iterable of ports
-        for port in ports:
-            #running the command which closes ports
-            client.run('%s stop %s'%(jupyterlab, port), hide=True)
-
-    #The master command; tries to start jupyter server on remote side; returns list of running servers aftter performing the start operation
-    #If number of active jupyter notebooks is found to be not equal to 1; try closing ports and restarting new session
+def get_notebooks(client, executable):
+    listing = f'{executable} {"list"}'
     try:
-        notebooks = "{.stdout}".format(client.run(nblistings, hide=True)).split('\n')[1:-1]; time.sleep(2)
+        notebooks = "{.stdout}".format(client.run(listing, hide=True)).split('\n')[1:-1]; time.sleep(2)
         if len(notebooks) == 0:
             raise Exception
-        print('Notebook found. Connecting ...')
+        logger.info('Notebook found. Connecting ...')
     except:
-        print('Starting new session ...')
-        kill_tmux(); time.sleep(2)
-        notebooks = start(); time.sleep(5)
+        logger.info('Starting new session ...')
+        kill_tmux(client); time.sleep(2)
+        notebooks = start_session(client, executable); time.sleep(5)
+    return notebooks 
+
+def main(host, user='ugiri', browser='chrome', lab=False, executable=None):
     
+    client = Connection(host=host, user=user, forward_agent=True)
+    
+    if executable is None:
+        executable = f'jupyter-{"lab" if lab else "notebook"}'
+    
+    assert_executable_found(client, [executable, 'tmux'])
+    
+    notebooks = get_notebooks(client, executable)
+   
     if len(notebooks) > 1:
-        print('More than one running server found')
-        print(notebooks)
-        #extract port numbers from list of running server url
-        ports = [int(x.split('localhost:')[-1].split('/')[0]) for x in notebooks if bool(x)]
-        #close the ports
-        close(ports)
-        #try starting a jupyter server again
-        #notebooks = start()
+        logger.info('More than one running server found. Closing all of them and restaring a new session')
+        all_ports = [int(x.split('localhost:')[-1].split('/')[0]) for x in notebooks if bool(x)]
+        close_sessions(client, executable, all_ports)
+        notebooks = start_session(client, executable); time.sleep(4)
      
     #The following code is the logic after a single jupyter server has been successfully started on a remote server inside a tmux session
     #Get the remote port number
@@ -115,15 +75,14 @@ def main(host, env='cmb', browser='chrome', lab=False, hop=True):
     #cllose socket
     s.close()
     #Compose the tunneling command to be executed on the client side
-    local_notebook_command = 'ssh -N -f -L localhost:{}:localhost:{} {}'.format(local_port, remote_port, "ugiri@{}".format(host))
+    local_notebook_command = 'ssh -N -f -L localhost:{}:localhost:{} {}'.format(local_port, remote_port, "{}@{}".format(user, host))
     #execute the above command
     subprocess.call(local_notebook_command, shell=True)
     #Compose the url for opening the notebook
     url='http://localhost:{}/?token={}'.format(local_port, remote_token)
-    loguru.logger.debug('url: ', url.split('ugiri/')[-1])
     #Open the notebook on the desired browser
     #webbrowser.get(browsers[browser]).open(url=url.split('ugiri/')[-1])
-    webbrowser.get(browsers[browser]).open(url=url)
+    webbrowser.get(get_browser_driver(browser)).open(url=url.split('ugiri/')[-1])
     #webbrowser.open(url=url)
 
 if __name__ == '__main__':
