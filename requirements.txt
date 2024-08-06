@@ -1,12 +1,12 @@
 bcrypt
 certifi
 cffi
-cryptography>=3.2
+cryptography==36.0
 fabric
 fire
 invoke
 loguru
-paramiko>=2.10.1
+paramiko==3.0
 pycparser
 PyNaCl
 six
